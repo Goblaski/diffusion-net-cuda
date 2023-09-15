@@ -13,6 +13,7 @@ import scipy.spatial
 import torch
 from torch.distributions.categorical import Categorical
 import sklearn.neighbors
+from itertools import combinations
 
 import robust_laplacian
 import potpourri3d as pp3d
@@ -143,22 +144,18 @@ def vertex_normals(verts, faces, n_neighbors_cloud=30):
             
 
     normals = torch.from_numpy(normals).to(device=verts.device, dtype=verts.dtype)
+    normals = normals.to(torch.float32)
         
     if torch.any(torch.isnan(normals)): raise ValueError("NaN normals :(")
 
     return normals
 
 
-def build_tangent_frames(verts, faces, normals=None):
+def build_tangent_frames(verts, faces, vert_normals=None):
 
     V = verts.shape[0]
     dtype = verts.dtype
     device = verts.device
-
-    if normals == None:
-        vert_normals = vertex_normals(verts, faces)  # (V,3)
-    else:
-        vert_normals = normals 
 
     # = find an orthogonal basis
 
@@ -211,33 +208,156 @@ def edge_tangent_vectors(verts, frames, edges):
 
     return edge_tangent
 
-def build_grad_cuda(verts_cuda, edges_tensor_cuda, edge_tangent_vecs, n_neighbors_cloud=30, return_device='cpu'):
+# Curvature computateion. Inspired from: https://nl.mathworks.com/matlabcentral/fileexchange/32573-patch-curvature
+def get_curvature(vertices,normals,nHoodRange=1):
+
+    nVertices = len(vertices)
+
+    # Compute rortation matrices
+    Minv = torch.zeros((3,3,nVertices),device=vertices.device)
+    k = torch.rand((nVertices,3),device=vertices.device)
+    l = torch.zeros((3,),device=vertices.device)
+    kl = torch.zeros((3,),device=vertices.device)
+
+    # Determine nHood
+    nHoodRangeSquare = nHoodRange * nHoodRange
+    
+    # Get Minv
+    Minv = dnc.get_minv_matrix(normals)
+    
+    nHoodList = []
+    for v in vertices:
+        dists = vertices-v
+        dists_length_square = (dists*dists).sum(axis=1)
+        nHood = torch.where(dists_length_square<nHoodRangeSquare)
+        nHoodList.append(nHood[0])
+
+    vertices_np = vertices.cpu().numpy()
+
+    #From hereon it is faster to use numpy (lots of lin. algebra)
+    i1i2 = np.zeros((nVertices,4))
+    curvature = np.zeros((nVertices,2))
+    for i in range(nVertices):
+        We = np.matmul(vertices_np[nHoodList[i].cpu()],Minv[:,:,i].cpu())
+        if We.ndim == 1:
+            We = np.expand_dims(We,0)
+        f = We[:,0]
+        x = We[:,1]
+        y = We[:,2]
+        FM = np.vstack((x**2, y**2, x*y, x, y, np.ones(x.shape))).T
+        A = FM
+        b = f
+        
+        num_vars = A.shape[1]
+        rank = np.linalg.matrix_rank(A)
+        if rank == num_vars:              
+            sol = np.linalg.lstsq(A, b)[0]    # not under-determined
+        else:
+            for nz in combinations(range(num_vars), rank):    # the variables not set to zero
+                try: 
+                    nz = np.squeeze(nz)
+                    sol = np.zeros((num_vars, 1))  
+                    sub = np.asarray(np.linalg.solve(A[:, nz], b))
+                    if sub.ndim == 1:
+                        sub = np.expand_dims(sub,-1)
+                    sol[nz, :] = sub
+                except np.linalg.LinAlgError:     
+                    pass                    # picked bad variables, can't solve
+        
+        Dxx = 2*sol[0]
+        Dxy = sol[2]
+        Dyy = 2*sol[1]
+        
+        tmp = np.sqrt((Dxx - Dyy)** 2 + 4*Dxy**2)
+        v2x = 2*Dxy
+        v2y = Dyy - Dxx + tmp
+        mag = np.sqrt(v2x**2 + v2y**2)
+        v2x = v2x / mag
+        v2y = v2y / mag
+        
+        v1x = -v2y
+        v1y = v2x
+        
+        mu1 = (0.5*(Dxx + Dyy + tmp))
+        mu2 = (0.5*(Dxx + Dyy - tmp))
+        
+        if (abs(mu1)<abs(mu2)):
+            Lambda1=mu1;
+            Lambda2=mu2;
+            I2=[v1x, v1y]
+            I1=[v2x, v2y]
+        else:
+            Lambda1=mu2;
+            Lambda2=mu1;
+            I2=[v2x, v2y]
+            I1=[v1x, v1y]
+        
+        if Lambda1 < Lambda2:
+            curvature[i,0] = Lambda1
+            curvature[i,1] = Lambda2
+            i1i2[i,0] = I1[0]
+            i1i2[i,1] = I1[1]
+            i1i2[i,2] = I2[0]
+            i1i2[i,3] = I2[1]
+        else:
+            curvature[i,0] = Lambda2
+            curvature[i,1] = Lambda1
+            i1i2[i,0] = I2[0]
+            i1i2[i,1] = I2[1]
+            i1i2[i,2] = I1[0]
+            i1i2[i,3] = I1[1]
+
+    cMean = (curvature[:,0]+curvature[:,1])/2
+    cGauss = (curvature[:,0]*curvature[:,1])
+
+    curvature = torch.from_numpy(curvature).to(torch.float)
+    cMean = torch.from_numpy(cMean).to(torch.float)
+    cGauss = torch.from_numpy(cGauss).to(torch.float)
+    i1i2 = torch.from_numpy(i1i2).to(torch.float)
+
+    M = torch.transpose(Minv,0,1)
+
+    d1l = torch.hstack((torch.zeros((nVertices,1)),i1i2[:,:2])).to(Minv.device)
+    d2l = torch.hstack((torch.zeros((nVertices,1)),i1i2[:,2:])).to(Minv.device)
+
+    for i, (d1, d2) in enumerate(zip(d1l,d2l)):
+        d1l[i] =  torch.matmul(d1,M[:,:,i])
+        d2l[i] =  torch.matmul(d2,M[:,:,i])
+
+    return curvature, cMean, cGauss, i1i2, d1l, d2l
+
+def build_grad_cuda(verts_cuda, edges_tensor_cuda, edge_tangent_vecs, n_neighbors_cloud=12, return_device='cpu'):
     # Grad_data currently gives additional debug information. Will be removed later.
     grad_data = dnc.build_grad(verts_cuda, edges_tensor_cuda, edge_tangent_vecs,n_neighbors_cloud)
 
     # only supporting full neighbourhoods now (all vertices must have n_neighbors_cloud neighbours)
-    assert(torch.max(grad_data[4]) == torch.min(grad_data[4]))
+    #assert(torch.max(grad_data[4]) == torch.min(grad_data[4]))
+
+    sel_rows = torch.where(grad_data[0] >= 0)
 
     if grad_data[0].device != return_device:
-        rows = grad_data[0].to(return_device).type(torch.LongTensor)
-        cols = grad_data[0].to(return_device).type(torch.LongTensor)
-        data_gradX = grad_data[2].to(return_device)
-        data_gradY = grad_data[3].to(return_device)
+        rows = grad_data[0][sel_rows].to(return_device).type(torch.LongTensor)
+        cols = grad_data[1][sel_rows].to(return_device).type(torch.LongTensor)
+        data_gradX = grad_data[2][sel_rows].to(return_device)
+        data_gradY = grad_data[3][sel_rows].to(return_device)
     else:
-        rows = grad_data[0].type(torch.LongTensor)
-        cols = grad_data[0].type(torch.LongTensor)
-        data_gradX = grad_data[2]
-        data_gradY = grad_data[3]
+        rows = grad_data[0][sel_rows].type(torch.LongTensor)
+        cols = grad_data[1][sel_rows].type(torch.LongTensor)
+        data_gradX = grad_data[2][sel_rows]
+        data_gradY = grad_data[3][sel_rows]
 
     indices = torch.vstack((rows,cols))
     shape = torch.Size([len(verts_cuda),len(verts_cuda)])
 
-    gradX = torch.sparse.FloatTensor(indices, torch.FloatTensor(data_gradX), torch.Size(shape)).coalesce()
-    gradY = torch.sparse.FloatTensor(indices, torch.FloatTensor(data_gradY), torch.Size(shape)).coalesce()
+    if indices.get_device() != data_gradX.get_device():
+        indices = indices.to(data_gradX.get_device())
+
+    gradX = torch.sparse.FloatTensor(indices, data_gradX, torch.Size(shape)).coalesce()
+    gradY = torch.sparse.FloatTensor(indices, data_gradY, torch.Size(shape)).coalesce()
 
     return gradX, gradY
 
-def compute_operators(verts, faces, k_eig, normals=None):
+def compute_operators(verts, faces, k_eig, normals=None, curvature_range=0.0, eigsh_tol=1e-24):
     """
     Builds spectral operators for a mesh/point cloud. Constructs mass matrix, eigenvalues/vectors for Laplacian, and gradient matrix.
 
@@ -249,6 +369,8 @@ def compute_operators(verts, faces, k_eig, normals=None):
       - vertices: (V,3) vertex positions
       - faces: (F,3) list of triangular faces. If empty, assumed to be a point cloud.
       - k_eig: number of eigenvectors to use
+      - curvature_range: (float) the range of which the curvature computation must occur (in vertex unit space). 0 or None = Disabled
+      - eigsh_tol: (float) the tolerance used in sla.eigsh (def.)
 
     Returns:
       - frames: (V,3,3) X/Y/Z coordinate frame at each vertex. Z coordinate is normal (e.g. [:,2,:] for normals)
@@ -273,8 +395,15 @@ def compute_operators(verts, faces, k_eig, normals=None):
 
     verts_np = toNP(verts).astype(np.float64)
     faces_np = toNP(faces)
-    frames = build_tangent_frames(verts, faces, normals=normals)
-    frames_np = toNP(frames)
+
+    # Compute/get before build_tangent_frames in case we need curvature computaiton
+    if normals == None:
+        normals = vertex_normals(verts, faces)  # (V,3)
+
+    if curvature_range > 0:
+        curvature, cMean, cGauss, i1i2, d1l, d2l  = get_curvature(verts,normals,nHoodRange=curvature_range)
+
+    frames = build_tangent_frames(verts, faces, vert_normals=normals)
 
     # Build the scalar Laplacian
     if is_cloud:
@@ -310,7 +439,7 @@ def compute_operators(verts, faces, k_eig, normals=None):
         while True:
             try:
                 # We would be happy here to lower tol or maxiter since we don't need these to be super precise, but for some reason those parameters seem to have no effect
-                evals_np, evecs_np = sla.eigsh(L_eigsh, k=k_eig, M=Mmat, sigma=eigs_sigma)
+                evals_np, evecs_np = sla.eigsh(L_eigsh, k=k_eig, M=Mmat, sigma=eigs_sigma,tol=eigsh_tol)
             
                 # Clip off any eigenvalues that end up slightly negative due to numerical weirdness
                 evals_np = np.clip(evals_np, a_min=0., a_max=float('inf'))
@@ -355,10 +484,79 @@ def compute_operators(verts, faces, k_eig, normals=None):
     evals = torch.from_numpy(evals_np).to(device=device, dtype=dtype)
     evecs = torch.from_numpy(evecs_np).to(device=device, dtype=dtype)
 
-    return frames, massvec, L, evals, evecs, gradX, gradY
+    if curvature_range > 0:
+        return frames, massvec, L, evals, evecs, gradX, gradY, curvature, cMean, cGauss, i1i2, d1l, d2l
+    else:
+        return frames, massvec, L, evals, evecs, gradX, gradY
 
+# Returned the legacy (CPU) version of build_grad
+def build_grad(verts, edges, edge_tangent_vectors):
+    """
+    Build a (V, V) complex sparse matrix grad operator. Given real inputs at vertices, produces a complex (vector value) at vertices giving the gradient. All values pointwise.
+    - edges: (2, E)
+    """
+    
+    edges_np = toNP(edges.cpu())
+    edge_tangent_vectors = toNP(edge_tangent_vectors.cpu())
 
-def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=None):
+    # TODO find a way to do this in pure numpy?
+
+    # Build outgoing neighbor lists
+    N = verts.shape[0]
+    vert_edge_outgoing = [[] for i in range(N)]
+    for iE in range(edges_np.shape[1]):
+        tail_ind = edges_np[0, iE]
+        tip_ind = edges_np[1, iE]
+        if tip_ind != tail_ind:
+            vert_edge_outgoing[tail_ind].append(iE)
+
+    # Build local inversion matrix for each vertex
+    row_inds = []
+    col_inds = []
+    data_vals = []
+    eps_reg = 1e-5
+    for iV in range(N):
+        n_neigh = len(vert_edge_outgoing[iV])
+
+        lhs_mat = np.zeros((n_neigh, 2))
+        rhs_mat = np.zeros((n_neigh, n_neigh + 1))
+        ind_lookup = [iV]
+        for i_neigh in range(n_neigh):
+            iE = vert_edge_outgoing[iV][i_neigh]
+            jV = edges_np[1, iE]
+            ind_lookup.append(jV)
+    
+            edge_vec = edge_tangent_vectors[iE][:]
+            w_e = 1.
+
+            lhs_mat[i_neigh][:] = w_e * edge_vec
+            rhs_mat[i_neigh][0] = w_e * (-1)
+            rhs_mat[i_neigh][i_neigh + 1] = w_e * 1
+
+        lhs_T = lhs_mat.T
+        lhs_inv = np.linalg.inv(lhs_T @ lhs_mat + eps_reg * np.identity(2)) @ lhs_T
+
+        sol_mat = lhs_inv @ rhs_mat
+        sol_coefs = (sol_mat[0, :] + 1j * sol_mat[1, :]).T
+
+        for i_neigh in range(n_neigh + 1):
+            i_glob = ind_lookup[i_neigh]
+
+            row_inds.append(iV)
+            col_inds.append(i_glob)
+            data_vals.append(sol_coefs[i_neigh])
+
+    # build the sparse matrix
+    row_inds = np.array(row_inds)
+    col_inds = np.array(col_inds)
+    data_vals = np.array(data_vals)
+    mat = scipy.sparse.coo_matrix(
+        (data_vals, (row_inds, col_inds)), shape=(
+            N, N)).tocsc()
+
+    return mat
+
+def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=None,curvature_range=0.0):
     N = len(verts_list)
             
     frames = [None] * N
@@ -368,6 +566,13 @@ def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=
     evecs = [None] * N
     gradX = [None] * N
     gradY = [None] * N
+    if curvature_range > 0:
+        curvature = [None] * N
+        cMean = [None] * N
+        cGauss = [None] * N
+        i1i2 = [None] * N
+        d1l = [None] * N
+        d2l = [None] * N
 
     inds = [i for i in range(N)]
     # process in random order
@@ -376,9 +581,9 @@ def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=
     for num, i in enumerate(inds):
         print("get_all_operators() processing {} / {} {:.3f}%".format(num, N, num / N * 100))
         if normals is None:
-            outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir)
+            outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir,curvature_range=curvature_range)
         else:
-            outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir, normals=normals[i])
+            outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir, normals=normals[i],curvature_range=curvature_range)
         frames[i] = outputs[0]
         massvec[i] = outputs[1]
         L[i] = outputs[2]
@@ -386,10 +591,21 @@ def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=
         evecs[i] = outputs[4]
         gradX[i] = outputs[5]
         gradY[i] = outputs[6]
-        
-    return frames, massvec, L, evals, evecs, gradX, gradY
 
-def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, overwrite_cache=False):
+        if curvature_range > 0:
+            curvature[i] = outputs[7]
+            cMean[i] = outputs[8]
+            cGauss[i] = outputs[9]
+            i1i2[i] = outputs[10]
+            d1l[i] = outputs[11]
+            d2l[i] = outputs[12]
+
+    if curvature_range > 0:
+        return frames, massvec, L, evals, evecs, gradX, gradY, curvature, cMean, cGauss, i1i2, d1l, d2l
+    else:    
+        return frames, massvec, L, evals, evecs, gradX, gradY
+
+def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, overwrite_cache=False,curvature_range=0.0):
     """
     See documentation for compute_operators(). This essentailly just wraps a call to compute_operators, using a cache if possible.
     All arrays are always computed using double precision for stability, then truncated to single precision floats to store on disk, and finally returned as a tensor with dtype/device matching the `verts` input.
@@ -458,6 +674,15 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                     os.remove(search_path)
                     break
 
+                if (curvature_range > 0) and ("curvature_range" not in npzfile):
+                    print("  overwriting cache --- curvature_range are absent")
+                    os.remove(search_path)
+                    break
+
+                if npzfile["curvature_range"] != curvature_range:
+                    print("  overwriting cache --- curvature_range mismatch")
+                    os.remove(search_path)
+                    break
 
                 def read_sp_mat(prefix):
                     data = npzfile[prefix + "_data"]
@@ -475,6 +700,17 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                 evecs = npzfile["evecs"][:,:k_eig]
                 gradX = read_sp_mat("gradX")
                 gradY = read_sp_mat("gradY")
+
+                if curvature_range > 0:
+                    curvature = npzfile["curvature"]
+                    cMean = npzfile["cMean"]
+                    cGauss = npzfile["cGauss"]
+                    i1i2 = npzfile["i1i2"]
+
+                    curvature = torch.from_numpy(curvature).to(device=device, dtype=dtype)
+                    cMean = torch.from_numpy(cMean).to(device=device, dtype=dtype)
+                    cGauss = torch.from_numpy(cGauss).to(device=device, dtype=dtype)
+                    i1i2 = torch.from_numpy(i1i2).to(device=device, dtype=dtype)
 
                 frames = torch.from_numpy(frames).to(device=device, dtype=dtype)
                 mass = torch.from_numpy(mass).to(device=device, dtype=dtype)
@@ -500,7 +736,10 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
     if not found:
 
         # No matching entry found; recompute.
-        frames, mass, L, evals, evecs, gradX, gradY = compute_operators(verts, faces, k_eig, normals=normals)
+        if curvature_range > 0:
+            frames, mass, L, evals, evecs, gradX, gradY, curvature, cMean, cGauss, i1i2, d1l, d2l = compute_operators(verts, faces, k_eig, normals=normals,curvature_range=curvature_range)
+        else:
+            frames, mass, L, evals, evecs, gradX, gradY = compute_operators(verts, faces, k_eig, normals=normals)
 
         dtype_np = np.float32
 
@@ -511,29 +750,60 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
             gradX_np = utils.sparse_torch_to_np(gradX).astype(dtype_np)
             gradY_np = utils.sparse_torch_to_np(gradY).astype(dtype_np)
 
-            np.savez(search_path,
-                     verts=verts_np.astype(dtype_np),
-                     frames=toNP(frames).astype(dtype_np),
-                     faces=faces_np,
-                     k_eig=k_eig,
-                     mass=toNP(mass).astype(dtype_np),
-                     L_data = L_np.data.astype(dtype_np),
-                     L_indices = L_np.indices,
-                     L_indptr = L_np.indptr,
-                     L_shape = L_np.shape,
-                     evals=toNP(evals).astype(dtype_np),
-                     evecs=toNP(evecs).astype(dtype_np),
-                     gradX_data = gradX_np.data.astype(dtype_np),
-                     gradX_indices = gradX_np.indices,
-                     gradX_indptr = gradX_np.indptr,
-                     gradX_shape = gradX_np.shape,
-                     gradY_data = gradY_np.data.astype(dtype_np),
-                     gradY_indices = gradY_np.indices,
-                     gradY_indptr = gradY_np.indptr,
-                     gradY_shape = gradY_np.shape,
-                     )
+            if curvature_range > 0:
+                np.savez(search_path,
+                        verts=verts_np.astype(dtype_np),
+                        frames=toNP(frames).astype(dtype_np),
+                        faces=faces_np,
+                        k_eig=k_eig,
+                        mass=toNP(mass).astype(dtype_np),
+                        curvature_range=curvature_range,
+                        curvature=toNP(curvature).astype(dtype_np),
+                        cMean=toNP(cMean).astype(dtype_np),
+                        cGauss=toNP(cGauss).astype(dtype_np),
+                        i1i2=toNP(i1i2).astype(dtype_np),
+                        L_data = L_np.data.astype(dtype_np),
+                        L_indices = L_np.indices,
+                        L_indptr = L_np.indptr,
+                        L_shape = L_np.shape,
+                        evals=toNP(evals).astype(dtype_np),
+                        evecs=toNP(evecs).astype(dtype_np),
+                        gradX_data = gradX_np.data.astype(dtype_np),
+                        gradX_indices = gradX_np.indices,
+                        gradX_indptr = gradX_np.indptr,
+                        gradX_shape = gradX_np.shape,
+                        gradY_data = gradY_np.data.astype(dtype_np),
+                        gradY_indices = gradY_np.indices,
+                        gradY_indptr = gradY_np.indptr,
+                        gradY_shape = gradY_np.shape,
+                        )
+            else:
+                np.savez(search_path,
+                        verts=verts_np.astype(dtype_np),
+                        frames=toNP(frames).astype(dtype_np),
+                        faces=faces_np,
+                        k_eig=k_eig,
+                        mass=toNP(mass).astype(dtype_np),
+                        L_data = L_np.data.astype(dtype_np),
+                        L_indices = L_np.indices,
+                        L_indptr = L_np.indptr,
+                        L_shape = L_np.shape,
+                        evals=toNP(evals).astype(dtype_np),
+                        evecs=toNP(evecs).astype(dtype_np),
+                        gradX_data = gradX_np.data.astype(dtype_np),
+                        gradX_indices = gradX_np.indices,
+                        gradX_indptr = gradX_np.indptr,
+                        gradX_shape = gradX_np.shape,
+                        gradY_data = gradY_np.data.astype(dtype_np),
+                        gradY_indices = gradY_np.indices,
+                        gradY_indptr = gradY_np.indptr,
+                        gradY_shape = gradY_np.shape,
+                        )
 
-    return frames, mass, L, evals, evecs, gradX, gradY
+    if curvature_range > 0:
+        return frames, mass, L, evals, evecs, gradX, gradY, curvature, cMean, cGauss, i1i2, d1l, d2l
+    else:
+        return frames, mass, L, evals, evecs, gradX, gradY
 
 def to_basis(values, basis, massvec):
     """

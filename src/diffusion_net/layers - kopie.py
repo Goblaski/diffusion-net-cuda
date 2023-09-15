@@ -197,7 +197,7 @@ class DiffusionNetBlock(nn.Module):
         self.mlp = MiniMLP([self.MLP_C] + self.mlp_hidden_dims + [self.C_width], dropout=self.dropout)
 
 
-    def forward(self, x_in, mass, L, evals, evecs, gradX = None, gradY = None):
+    def forward(self, x_in, mass, L, evals, evecs, gradX, gradY):
 
         # Manage dimensions
         B = x_in.shape[0] # batch dimension
@@ -211,22 +211,19 @@ class DiffusionNetBlock(nn.Module):
 
         # Compute gradient features, if using
         if self.with_gradient_features:
-            # Fallback option (Legacy purposes)
-            if gradX == None:
-                x_grad_features = torch.zeros_like(x_in)
-            else:
-                # Compute gradients
-                x_grads = [] # Manually loop over the batch (if there is a batch dimension) since torch.mm() doesn't support batching
-                for b in range(B):
-                    # gradient after diffusion
-                    x_gradX = torch.sparse.mm(gradX[b,...], x_diffuse[b,...])
-                    x_gradY = torch.sparse.mm(gradY[b,...], x_diffuse[b,...])
 
-                    x_grads.append(torch.stack((x_gradX, x_gradY), dim=-1))
-                x_grad = torch.stack(x_grads, dim=0)
+            # Compute gradients
+            x_grads = [] # Manually loop over the batch (if there is a batch dimension) since torch.mm() doesn't support batching
+            for b in range(B):
+                # gradient after diffusion
+                x_gradX = torch.mm(gradX[b,...], x_diffuse[b,...])
+                x_gradY = torch.mm(gradY[b,...], x_diffuse[b,...])
 
-                # Evaluate gradient features
-                x_grad_features = self.gradient_features(x_grad) 
+                x_grads.append(torch.stack((x_gradX, x_gradY), dim=-1))
+            x_grad = torch.stack(x_grads, dim=0)
+
+            # Evaluate gradient features
+            x_grad_features = self.gradient_features(x_grad) 
 
             # Stack inputs to mlp
             feature_combined = torch.cat((x_in, x_diffuse, x_grad_features), dim=-1)
@@ -263,8 +260,6 @@ class DiffusionNet(nn.Module):
             diffusion_method (string):      how to evaluate diffusion, one of ['spectral', 'implicit_dense']. If implicit_dense is used, can set k_eig=0, saving precompute.
             with_gradient_features (bool):  if True, use gradient features (default: True)
             with_gradient_rotations (bool): if True, use gradient also learn a rotation of each gradient. Set to True if your surface has consistently oriented normals, and False otherwise (default: True)
-            use_first_lin (bool):           if True, the first affine layer will be used (could be disabled if you e.g. combine multiple DiffusionNet models)
-            use_last_lin (bool):            if True, the last affine layer will be used (could be disabled if you e.g. combine multiple DiffusionNet models)
         """
 
         super(DiffusionNet, self).__init__()
@@ -277,7 +272,7 @@ class DiffusionNet(nn.Module):
         self.C_width = C_width
         self.N_block = N_block
 
-        # Options to use the first and last layer
+        #
         self.use_first_lin = use_first_lin
         self.use_last_lin = use_last_lin
 
@@ -307,7 +302,7 @@ class DiffusionNet(nn.Module):
             self.first_lin = nn.Linear(C_in, C_width)
         if self.use_last_lin:
             self.last_lin = nn.Linear(C_width, C_out)
-
+       
         # DiffusionNet blocks
         self.blocks = []
         for i_block in range(self.N_block):

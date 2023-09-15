@@ -11,7 +11,7 @@
 #define NUM_BLOCKS 64
 #define BLOCK_SIZE 256
 
-#define MAX_NHOOD 30
+#define MAX_NHOOD 60
 
 
 #endif

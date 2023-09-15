@@ -60,6 +60,92 @@ void assign_vert_edge_outgoing_cuda(
     #endif
 }
 
+void vertices_mapping_lookup_cuda(
+    const int num_vertices_new,
+    const int num_vertices_old,
+    torch::Tensor vertices_new,
+    torch::Tensor vertices_old,
+    torch::Tensor mapping_new_to_old
+) {
+    int blocks = ceilf(num_vertices_new / (float)BLOCK_SIZE);    
+
+    #if DEBUG
+        cudaEvent_t start = startTimer();
+    #endif
+
+    kernel::vertices_mapping_lookup_cuda_kernel<<<blocks, BLOCK_SIZE>>>(
+        num_vertices_new,
+        num_vertices_old,
+        vertices_new.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        vertices_old.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        mapping_new_to_old.packed_accessor32<int,1,torch::RestrictPtrTraits>()
+    );
+
+    #if DEBUG
+        stopTimer(start, "vertices_mapping_lookup_cuda");
+
+        checkError("vertices_mapping_lookup_cuda");
+    #endif
+}
+
+void vertices_mapping_close_cuda(
+    const int num_vertices_lookup,
+    const int num_vertices_marker,
+    const float max_distance_squared,
+    torch::Tensor vertices_lookup,
+    torch::Tensor vertices_marker,
+    torch::Tensor mapped_close_vertices
+) {
+    int blocks = ceilf(num_vertices_lookup / (float)BLOCK_SIZE);    
+
+    #if DEBUG
+        cudaEvent_t start = startTimer();
+    #endif
+
+    kernel::vertices_mapping_close_cuda_kernel<<<blocks, BLOCK_SIZE>>>(
+        num_vertices_lookup,
+        num_vertices_marker,
+        max_distance_squared,
+        vertices_lookup.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        vertices_marker.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        mapped_close_vertices.packed_accessor32<int,1,torch::RestrictPtrTraits>()
+    );
+
+    #if DEBUG
+        stopTimer(start, "vertices_mapping_close_cuda");
+
+        checkError("vertices_mapping_close_cuda");
+    #endif
+}
+
+
+void get_minv_matrix_cuda(
+    const int num_normals,
+    const torch::Tensor normals,
+    const torch::Tensor k,
+    torch::Tensor minv
+) {
+    int blocks = ceilf(num_normals / (float)BLOCK_SIZE);    
+
+    #if DEBUG
+        cudaEvent_t start = startTimer();
+    #endif
+
+    kernel::get_minv_matrix_cuda_kernel<<<blocks, BLOCK_SIZE>>>(
+        num_normals,
+        normals.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        k.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+        minv.packed_accessor32<float,3,torch::RestrictPtrTraits>()
+    );
+
+    #if DEBUG
+        stopTimer(start, "get_minv_matrix_cuda");
+
+        checkError("get_minv_matrix_cuda");
+    #endif
+}
+
+
 
 void build_grad_compressed_cuda(
         const int num_vertices,

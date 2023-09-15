@@ -6,6 +6,121 @@
 #include "macros.hpp"
 #include "geometry_cuda.hcu"
 
+#define CUDART_INF_F __int_as_float(0x7f800000)
+
+__global__ void kernel::vertices_mapping_lookup_cuda_kernel(
+    const int num_vertices_new,
+    const int num_vertices_old,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_new,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_old,
+    torch::PackedTensorAccessor32<int,1,torch::RestrictPtrTraits> mapping_new_to_old
+) {
+    int iV = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (iV < num_vertices_new) { // Sanity check
+        float v_x = vertices_new[iV][0];
+        float v_y = vertices_new[iV][1];
+        float v_z = vertices_new[iV][2];
+
+        float s_dist = CUDART_INF_F;
+        int s_id = -1;
+        float d_x, d_y, d_z, s;
+
+        for (int i=0; i<num_vertices_old;i++) {
+            d_x = vertices_old[i][0]-v_x;
+            d_y = vertices_old[i][1]-v_y;
+            d_z = vertices_old[i][2]-v_z;
+
+            s = d_x * d_x + d_y * d_y + d_z * d_z;
+
+            if (s < s_dist) {
+                s_dist = s;
+                s_id = i;
+            }
+        }
+
+        mapping_new_to_old[iV] = s_id;
+    }
+}
+
+__global__ void kernel::vertices_mapping_close_cuda_kernel(
+    const int num_vertices_lookup,
+    const int num_vertices_marker,
+    const float max_distance_squared,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_lookup,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_marker,
+    torch::PackedTensorAccessor32<int,1,torch::RestrictPtrTraits> mapped_close_vertices
+) {
+    int iV = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (iV < num_vertices_lookup) { // Sanity check
+        float v_x = vertices_lookup[iV][0];
+        float v_y = vertices_lookup[iV][1];
+        float v_z = vertices_lookup[iV][2];
+
+        float d_x, d_y, d_z, s;
+        bool found = false;
+
+        for (int i=0; i<num_vertices_marker;i++) {
+            d_x = vertices_marker[i][0]-v_x;
+            d_y = vertices_marker[i][1]-v_y;
+            d_z = vertices_marker[i][2]-v_z;
+
+            s = d_x * d_x + d_y * d_y + d_z * d_z;
+
+            if (s < max_distance_squared) {
+                found = true;
+                break;
+            }
+        }
+
+        if (found == true) {
+            mapped_close_vertices[iV] = 1;
+        } else {
+            mapped_close_vertices[iV] = 0;
+        }
+    }
+}
+
+__global__ void kernel::get_minv_matrix_cuda_kernel(
+    const int num_normals,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> normals,
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> k,
+    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> minv
+) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i < num_normals) { // Sanity check
+        float l_0 = k[i][1]*normals[i][2] - k[i][2]*normals[i][1];
+        float l_1 = k[i][2]*normals[i][0] - k[i][0]*normals[i][2];
+        float l_2 = k[i][0]*normals[i][1] - k[i][1]*normals[i][0];
+        float len = sqrt(l_0*l_0 + l_1*l_1 + l_2*l_2);
+        l_0 /= len;
+        l_1 /= len;
+        l_2 /= len;
+        
+        float kl_0 = l_1*normals[i][2] - l_2*normals[i][1];
+        float kl_1 = l_2*normals[i][0] - l_0*normals[i][2];
+        float kl_2 = l_0*normals[i][1] - l_1*normals[i][0];
+        float kl_len = sqrt(kl_0*kl_0 + kl_1*kl_1 + kl_2*kl_2);
+        kl_0 /= kl_len;
+        kl_1 /= kl_len;
+        kl_2 /= kl_len;
+
+        minv[0][0][i] = normals[i][0];
+        minv[1][0][i] = normals[i][1];
+        minv[2][0][i] = normals[i][2];
+
+        minv[0][1][i] = l_0;
+        minv[1][1][i] = l_1;
+        minv[2][1][i] = l_2;
+
+        minv[0][2][i] = kl_0;
+        minv[1][2][i] = kl_1;
+        minv[2][2][i] = kl_2;
+    }
+}
+
 
 __global__ void kernel::assign_vert_edge_outgoing_cuda_kernel(
     const torch::PackedTensorAccessor32<int,2,torch::RestrictPtrTraits> edges,

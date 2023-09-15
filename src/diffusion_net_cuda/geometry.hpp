@@ -18,6 +18,50 @@ void assign_vert_edge_outgoing_cuda(
     torch::Tensor vert_edge_outgoing_count
 );
 
+torch::Tensor vertices_mapping_lookup(
+    const torch::Tensor vertices_new,
+    const torch::Tensor vertices_old
+);
+
+torch::Tensor vertices_mapping_close(
+    const torch::Tensor vertices_lookup,
+    const torch::Tensor vertices_marker,
+    const float max_distance_squared
+);
+
+void vertices_mapping_lookup_cuda(
+    const int num_vertices_new,
+    const int num_vertices_old,
+    torch::Tensor vertices_new,
+    torch::Tensor vertices_old,
+    torch::Tensor mapping_new_to_old
+);
+
+void vertices_mapping_close_cuda(
+    const int num_vertices_lookup,
+    const int num_vertices_marker,
+    const float max_distance_squared,
+    torch::Tensor vertices_lookup,
+    torch::Tensor vertices_marker,
+    torch::Tensor mapped_close_vertices
+);
+
+torch::Tensor get_minv_matrix(
+    const torch::Tensor normals
+);
+
+torch::Tensor get_minv_matrix(
+    const torch::Tensor normals,
+    const torch::Tensor k
+);
+
+void get_minv_matrix_cuda(
+    const int num_normals,
+    const torch::Tensor normals,
+    const torch::Tensor k,
+    torch::Tensor minv
+);
+
 void build_grad_compressed_cuda(
         const int num_vertices,
         const int max_nhood,

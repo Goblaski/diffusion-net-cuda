@@ -16,6 +16,30 @@ void checkError(std::string kernelName);
 
 
 namespace kernel {
+    __global__ void vertices_mapping_lookup_cuda_kernel(
+        const int num_vertices_new,
+        const int num_vertices_old,
+        const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_new,
+        const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_old,
+        torch::PackedTensorAccessor32<int,1,torch::RestrictPtrTraits> mapping_new_to_old
+    );
+
+    __global__ void vertices_mapping_close_cuda_kernel(
+        const int num_vertices_lookup,
+        const int num_vertices_marker,
+        const float max_distance_squared,
+        const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_lookup,
+        const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_marker,
+        torch::PackedTensorAccessor32<int,1,torch::RestrictPtrTraits> mapped_close_vertices
+    );
+
+    __global__ void get_minv_matrix_cuda_kernel(
+        const int num_normals,
+        const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> normals,
+        const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> k,
+        torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> minv
+    );
+
     __global__ void assign_vert_edge_outgoing_cuda_kernel(
         const torch::PackedTensorAccessor32<int,2,torch::RestrictPtrTraits> edges,
         torch::PackedTensorAccessor32<int,2,torch::RestrictPtrTraits> vert_edge_outgoing,
