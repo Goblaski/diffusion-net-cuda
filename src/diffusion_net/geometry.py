@@ -465,13 +465,13 @@ def compute_operators(verts, faces, k_eig, normals=None, curvature_range=0.0, ei
     if is_cloud:
         gradX, gradY = build_grad_point_cloud(verts, frames)
     else: # === WARNING DIFFUSION_NET_CUDA UNTESTED START ===
-        edges = torch.tensor(np.stack((inds_row, inds_col), axis=0), device=device, dtype=torch.int32)
+        edges = torch.tensor(np.stack((inds_row, inds_col), axis=0), device=device, dtype=torch.long)
         edge_vecs = edge_tangent_vectors(verts, frames, edges)
 
         # Optionally to have this on GPU earlier
         #edge_tangent_vecs = edge_tangent_vectors(verts, frames, edges)
         edge_tangent_vecs_cuda = edge_vecs.to('cuda:0')
-        edges = edges.to('cuda:0') #torch.tensor(edges, dtype=torch.int32, device='cuda:0')
+        edges = edges.to('cuda:0').to(torch.int32) #torch.tensor(edges, dtype=torch.int32, device='cuda:0')
         verts_cuda = verts.to('cuda:0')
         
         gradX, gradY = build_grad_cuda(verts_cuda, edges, edge_tangent_vecs_cuda,return_device=verts.device)
