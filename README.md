@@ -1,6 +1,11 @@
 **DiffusionNet CUDA**
 
-CUDA implementation of certain modules in DiffusionNet (primarily aimed at pre-processing)
+CUDA implementation of certain modules in DiffusionNet (primarily aimed at pre-processing). 
+
+Additional functions have been added:
+- Curvature computation of Meshes
+- Vertex mapping lookup (finds the closest vertex in mesh A corresponding to a vertex in mesh B)
+- Vertex mapping annotation (marks all vertices in mesh A which are at least a certain amount of distance from any vertex in mesh B)
 
 **Setup**
 - Setup DiffusionNet as you would normally do (see below)
