@@ -1,7 +1,7 @@
 #ifndef MACROS_H
 #define MACROS_H
 
-#define DEBUG 1
+#define DEBUG 0
 
 // NOTE: AT_ASSERT has become AT_CHECK on master after 0.4.
 #define CHECK_DIMENSIONS(x) AT_ASSERTM((x).dim() == 2, #x " must be two-dimensional")
