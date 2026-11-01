@@ -153,6 +153,9 @@ def vertex_normals(verts, faces, n_neighbors_cloud=30):
 
 def build_tangent_frames(verts, faces, vert_normals=None):
 
+    if vert_normals is None:
+        vert_normals = vertex_normals(verts, faces)
+
     V = verts.shape[0]
     dtype = verts.dtype
     device = verts.device
@@ -190,9 +193,10 @@ def build_grad_point_cloud(verts, frames, n_neighbors_cloud=30):
 
     # Optionally to have this on GPU earlier
     edge_tangent_vecs = edge_tangent_vectors(verts, frames, edges)
-    edge_tangent_vecs_cuda = edge_tangent_vecs.to('cuda:0')
-    edges_tensor_cuda = torch.tensor(edges, dtype=torch.int32, device='cuda:0')
-    verts_cuda = verts.to('cuda:0')
+    cuda_device = verts.device if verts.is_cuda else torch.device('cuda', torch.cuda.current_device())
+    edge_tangent_vecs_cuda = edge_tangent_vecs.to(cuda_device)
+    edges_tensor_cuda = torch.tensor(edges, dtype=torch.int32, device=cuda_device)
+    verts_cuda = verts.to(cuda_device)
 
     return build_grad_cuda(verts_cuda, edges_tensor_cuda, edge_tangent_vecs_cuda,n_neighbors_cloud,verts.device)
 
@@ -326,35 +330,51 @@ def get_curvature(vertices,normals,nHoodRange=1):
 
     return curvature, cMean, cGauss, i1i2, d1l, d2l
 
-def build_grad_cuda(verts_cuda, edges_tensor_cuda, edge_tangent_vecs, n_neighbors_cloud=12, return_device='cpu'):
-    # Grad_data currently gives additional debug information. Will be removed later.
-    grad_data = dnc.build_grad(verts_cuda, edges_tensor_cuda, edge_tangent_vecs,n_neighbors_cloud)
+def build_grad_cuda(verts_cuda, edges_tensor_cuda, edge_tangent_vecs,
+                    n_neighbors_cloud=12, return_device='cpu'):
+    """Construct sparse per-vertex gradients with the patched CUDA extension.
 
-    # only supporting full neighbourhoods now (all vertices must have n_neighbors_cloud neighbours)
-    #assert(torch.max(grad_data[4]) == torch.min(grad_data[4]))
+    Allocates enough adjacency storage for the actual per-vertex degrees.
+    """
+    if not verts_cuda.is_cuda:
+        raise ValueError("verts_cuda must be a CUDA tensor")
 
-    sel_rows = torch.where(grad_data[0] >= 0)
+    device = verts_cuda.device
+    output_device = torch.device(return_device)
+    edges = edges_tensor_cuda.to(device=device, dtype=torch.int32).contiguous()
+    tangent = edge_tangent_vecs.to(device=device, dtype=torch.float32).contiguous()
 
-    if grad_data[0].device != return_device:
-        rows = grad_data[0][sel_rows].to(return_device).type(torch.LongTensor)
-        cols = grad_data[1][sel_rows].to(return_device).type(torch.LongTensor)
-        data_gradX = grad_data[2][sel_rows].to(return_device)
-        data_gradY = grad_data[3][sel_rows].to(return_device)
-    else:
-        rows = grad_data[0][sel_rows].type(torch.LongTensor)
-        cols = grad_data[1][sel_rows].type(torch.LongTensor)
-        data_gradX = grad_data[2][sel_rows]
-        data_gradY = grad_data[3][sel_rows]
+    if edges.ndim != 2 or edges.shape[0] != 2:
+        raise ValueError("edges must have shape (2,E)")
+    if tangent.ndim != 2 or tangent.shape != (edges.shape[1], 2):
+        raise ValueError("edge tangent vectors must have shape (E,2)")
 
-    indices = torch.vstack((rows,cols))
-    shape = torch.Size([len(verts_cuda),len(verts_cuda)])
+    # Self edges are skipped by both reference and CUDA implementations.
+    valid = edges[0] != edges[1]
+    degrees = torch.bincount(edges[0, valid].long(),
+                             minlength=verts_cuda.shape[0])
+    max_degree = int(degrees.max().item()) if degrees.numel() else 0
+    capacity = max(1, int(n_neighbors_cloud), max_degree)
 
-    if indices.get_device() != data_gradX.get_device():
-        indices = indices.to(data_gradX.get_device())
+    rows_gpu, cols_gpu, gx_gpu, gy_gpu, _ = dnc.build_grad(
+        verts_cuda, edges, tangent, capacity
+    )
+    sel = rows_gpu >= 0
+    rows = rows_gpu[sel].to(device=output_device, dtype=torch.long)
+    cols = cols_gpu[sel].to(device=output_device, dtype=torch.long)
+    indices = torch.stack((rows, cols), dim=0)
 
-    gradX = torch.sparse.FloatTensor(indices, data_gradX, torch.Size(shape)).coalesce()
-    gradY = torch.sparse.FloatTensor(indices, data_gradY, torch.Size(shape)).coalesce()
+    dtype = verts_cuda.dtype
+    values_x = gx_gpu[sel].to(device=output_device, dtype=dtype)
+    values_y = gy_gpu[sel].to(device=output_device, dtype=dtype)
+    shape = (verts_cuda.shape[0], verts_cuda.shape[0])
 
+    gradX = torch.sparse_coo_tensor(
+        indices, values_x, shape, device=output_device
+    ).coalesce()
+    gradY = torch.sparse_coo_tensor(
+        indices, values_y, shape, device=output_device
+    ).coalesce()
     return gradX, gradY
 
 def compute_operators(verts, faces, k_eig, normals=None, curvature_range=0.0, eigsh_tol=1e-24):
@@ -470,9 +490,10 @@ def compute_operators(verts, faces, k_eig, normals=None, curvature_range=0.0, ei
 
         # Optionally to have this on GPU earlier
         #edge_tangent_vecs = edge_tangent_vectors(verts, frames, edges)
-        edge_tangent_vecs_cuda = edge_vecs.to('cuda:0')
-        edges = edges.to('cuda:0').to(torch.int32) #torch.tensor(edges, dtype=torch.int32, device='cuda:0')
-        verts_cuda = verts.to('cuda:0')
+        cuda_device = verts.device if verts.is_cuda else torch.device('cuda', torch.cuda.current_device())
+        edge_tangent_vecs_cuda = edge_vecs.to(cuda_device)
+        edges = edges.to(device=cuda_device, dtype=torch.int32)
+        verts_cuda = verts.to(cuda_device)
         
         gradX, gradY = build_grad_cuda(verts_cuda, edges, edge_tangent_vecs_cuda,return_device=verts.device)
           # === WARNING DIFFUSION_NET_CUDA UNTESTED END ===
@@ -674,13 +695,18 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                     os.remove(search_path)
                     break
 
-                if (curvature_range > 0) and ("curvature_range" not in npzfile):
-                    print("  overwriting cache --- curvature_range are absent")
+                required = {"curvature_range"}
+                if curvature_range > 0:
+                    required.update({"curvature", "cMean", "cGauss",
+                                     "i1i2", "d1l", "d2l"})
+                if not required.issubset(npzfile.files):
+                    print("  overwriting cache --- missing fields")
+                    npzfile.close()
                     os.remove(search_path)
                     break
-
-                if npzfile["curvature_range"] != curvature_range:
-                    print("  overwriting cache --- curvature_range mismatch")
+                if float(npzfile["curvature_range"].item()) != float(curvature_range):
+                    print("  overwriting cache --- curvature range mismatch")
+                    npzfile.close()
                     os.remove(search_path)
                     break
 
@@ -706,11 +732,15 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                     cMean = npzfile["cMean"]
                     cGauss = npzfile["cGauss"]
                     i1i2 = npzfile["i1i2"]
+                    d1l = npzfile["d1l"]
+                    d2l = npzfile["d2l"]
 
                     curvature = torch.from_numpy(curvature).to(device=device, dtype=dtype)
                     cMean = torch.from_numpy(cMean).to(device=device, dtype=dtype)
                     cGauss = torch.from_numpy(cGauss).to(device=device, dtype=dtype)
                     i1i2 = torch.from_numpy(i1i2).to(device=device, dtype=dtype)
+                    d1l = torch.from_numpy(d1l).to(device=device, dtype=dtype)
+                    d2l = torch.from_numpy(d2l).to(device=device, dtype=dtype)
 
                 frames = torch.from_numpy(frames).to(device=device, dtype=dtype)
                 mass = torch.from_numpy(mass).to(device=device, dtype=dtype)
@@ -762,6 +792,8 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                         cMean=toNP(cMean).astype(dtype_np),
                         cGauss=toNP(cGauss).astype(dtype_np),
                         i1i2=toNP(i1i2).astype(dtype_np),
+                        d1l=toNP(d1l).astype(dtype_np),
+                        d2l=toNP(d2l).astype(dtype_np),
                         L_data = L_np.data.astype(dtype_np),
                         L_indices = L_np.indices,
                         L_indptr = L_np.indptr,
@@ -784,6 +816,7 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                         faces=faces_np,
                         k_eig=k_eig,
                         mass=toNP(mass).astype(dtype_np),
+                        curvature_range=curvature_range,
                         L_data = L_np.data.astype(dtype_np),
                         L_indices = L_np.indices,
                         L_indptr = L_np.indptr,

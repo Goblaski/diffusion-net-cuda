@@ -2,31 +2,24 @@
 #define GEOMETRY_CUDA_H
 
 #include <string>
-
 #include <torch/extension.h>
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-
 cudaEvent_t startTimer();
 void stopTimer(cudaEvent_t start, std::string kernelName);
-
 void checkError(std::string kernelName);
-
 
 namespace kernel {
     __global__ void vertices_mapping_lookup_cuda_kernel(
-        const int num_vertices_new,
-        const int num_vertices_old,
+        const int num_vertices_new, const int num_vertices_old,
         const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_new,
         const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_old,
         torch::PackedTensorAccessor32<int,1,torch::RestrictPtrTraits> mapping_new_to_old
     );
 
     __global__ void vertices_mapping_close_cuda_kernel(
-        const int num_vertices_lookup,
-        const int num_vertices_marker,
+        const int num_vertices_lookup, const int num_vertices_marker,
         const float max_distance_squared,
         const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_lookup,
         const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> vertices_marker,
@@ -48,6 +41,7 @@ namespace kernel {
 
     __global__ void build_grad_compressed_cuda_kernel(
         const int num_vertices,
+        const int max_nhood,
         const torch::PackedTensorAccessor32<int,2,torch::RestrictPtrTraits> edges,
         const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> edge_tangent_vectors,
         const torch::PackedTensorAccessor32<int,2,torch::RestrictPtrTraits> vert_edge_outgoing,
